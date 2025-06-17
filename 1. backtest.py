@@ -1,46 +1,33 @@
-# =============================================================================
-# 최종 통합 백테스팅 스크립트 (advanced_backtester.py)
-# 기능: 그리드 서치, 다수 티커 테스트, 시간봉/일봉 전환 지원
-# 최종 수정일: 2025-06-06 (오류 최종 수정)
-# =============================================================================
+# 1. backtest.py
 
-import pandas as pd
-import numpy as np
-import sqlite3
-import itertools
-import pandas_ta as ta
-import os
-from datetime import datetime
-
+# 필요한 라이브러리들을 가져옵니다.
+import pandas as pd  # 데이터 분석 및 조작
+import numpy as np  # 숫자 계산, 배열 처리
+import sqlite3  # SQLite 데이터베이스 사용
+import itertools  # 파라미터 조합을 만들기 위한 라이브러리
+import pandas_ta as ta  # 기술적 분석 지표를 쉽게 계산하기 위한 라이브러리
+import os  # 파일 존재 여부 확인 등 운영체제 기능 사용
+from datetime import datetime  # 날짜/시간 관련 기능
 
 # =============================================================================
-# --- 1. ✨ 통합 설정 (이 부분만 수정하여 사용하세요) ---
+# --- 1. ✨ 통합 설정 (사용자가 직접 수정하는 부분) ---
 # =============================================================================
 
 # --- 실행 모드 선택 ---
-# 'GRID_SEARCH' : 단일 티커에 대해 여러 파라미터 조합을 테스트 (그리드 서치)
-# 'MULTI_TICKER' : 여러 티커에 대해 지정된 챔피언 전략들을 테스트 (왕중왕전)
+# 'GRID_SEARCH' : 하나의 티커에 여러 파라미터 조합을 테스트 (최적 파라미터 찾기)
+# 'MULTI_TICKER' : 여러 티커에 정해진 우수 전략들을 테스트 (전략 비교)
 MODE = 'GRID_SEARCH'
 
 # --- 시간 단위 선택 ---
-# 'day' : 일봉 데이터로 테스트
-# 'minute60' : 60분봉(시간봉) 데이터로 테스트
-TARGET_INTERVAL = 'day'  # 'day' 또는 'minute60'
+TARGET_INTERVAL = 'day'  # 'day'(일봉) 또는 'minute60'(시간봉)
 
 # --- 기본 설정 ---
-INITIAL_CAPITAL = 10000000.0
-FEE_RATE = 0.0005
-MIN_ORDER_KRW = 5000.0
+INITIAL_CAPITAL = 10000000.0  # 초기 자본금 (1천만원)
+FEE_RATE = 0.0005  # 거래 수수료 (0.05%)
+MIN_ORDER_KRW = 5000.0  # 최소 주문 금액 (5천원)
 
 # --- 데이터베이스 경로 ---
-OHLCV_DB_PATH = "upbit_ohlcv.db"
-# MACRO_DB_PATH = "upbit_ohlcv_BTC.db"
-# FNG_DB_PATH = "fng_index.db"
-
-# --- 공통 테이블 이름 ---
-# FNG_TABLE = "fear_and_greed"
-# MACRO_TABLE = "macro_data"
-# MARKET_INDEX_TABLE = "market_index_top12_ew"
+OHLCV_DB_PATH = "upbit_ohlcv.db"  # collect_ohlcv.py가 생성한 DB 파일
 
 # =============================================================================
 # --- 2. 모드별 상세 설정 ---
@@ -48,8 +35,9 @@ OHLCV_DB_PATH = "upbit_ohlcv.db"
 
 # --- 2-1. 그리드 서치 모드 설정 (MODE = 'GRID_SEARCH' 일 때 사용) ---
 GRID_SEARCH_CONFIG = {
-    'target_ticker': 'KRW-BTC',
-    'target_strategy_name': 'rsi_mean_reversion',
+    'target_ticker': 'KRW-BTC',  # 테스트할 단일 티커
+    'target_strategy_name': 'rsi_mean_reversion',  # 테스트할 단일 전략
+    # 'param_grid'에 여러 값들을 리스트로 넣어주면, 이들의 모든 조합을 테스트합니다.
     'param_grid': {
         'partial_profit_target': [0.25],
         # 'partial_profit_ratio': [0.3, 0.5, 0.7]
@@ -106,6 +94,7 @@ MULTI_TICKER_CONFIG = {
                         #"KRW-LINK", "KRW-SOL", "KRW-SUI", "KRW-TRX", 'KRW-XLM', "KRW-XRP"],
     # "KRW-BTC", "KRW-ETH", "KRW-DOGE", "KRW-ADA", "KRW-AVAX",
     # "KRW-LINK", "KRW-SOL", "KRW-SUI", "KRW-TRX", 'KRW-XLM', "KRW-XRP" # 예시 티커
+    # 'champions_to_run': 테스트할 "챔피언" 전략들의 목록
     'champions_to_run': [
         {'strategy_name': 'volatility_breakout', 'experiment_name_prefix': 'candi1',
          'k': 1.5, 'exit_sma_period': 5},
@@ -127,47 +116,36 @@ MULTI_TICKER_CONFIG = {
     ]
 }
 
+
 # =============================================================================
-# --- 3. 핵심 함수들 (수정 완료, 더 이상 수정할 필요 없음) ---
+# --- 3. 핵심 함수들 (이 아래부터는 수정할 필요 없음) ---
 # =============================================================================
 
 def load_and_prepare_data(ohlcv_db_path, ohlcv_table):
+    """지정된 DB에서 데이터를 불러오고 백테스팅에 맞게 전처리하는 함수"""
     try:
-        # OHLCV 데이터 로드
         print(f"'{ohlcv_db_path}'에서 OHLCV 데이터 ('{ohlcv_table}') 로드 중...")
+        # SQLite DB에 연결하고, SQL 쿼리로 테이블 전체를 읽어 Pandas DataFrame으로 변환
         con_ohlcv = sqlite3.connect(ohlcv_db_path)
+        # index_col='timestamp' : 'timestamp' 컬럼을 DataFrame의 인덱스로 사용
+        # parse_dates=['timestamp'] : 'timestamp' 컬럼을 날짜/시간 타입으로 자동 변환
         df_ohlcv = pd.read_sql_query(f'SELECT * FROM "{ohlcv_table}"', con_ohlcv, index_col='timestamp',
                                      parse_dates=['timestamp'])
-        con_ohlcv.close()
+        con_ohlcv.close()  # DB 연결 종료
 
+        # 시간대 정보(timezone)를 제거하여 통일시킵니다. (오류 방지)
+        if df_ohlcv.index.tz is not None:
+            df_ohlcv.index = df_ohlcv.index.tz_localize(None)
+        # 시간 정보를 자정(00:00:00)으로 통일합니다. (일봉 데이터 처리 시 중요)
+        df_ohlcv.index = df_ohlcv.index.normalize()
+        print("✅ 데이터의 시간대 및 시간 정보 통일 완료.")
 
+        df_merged = df_ohlcv  # 이 예제에서는 다른 데이터와 병합하지 않으므로 그대로 사용
 
-        # 시간대 및 시간 정보 통일 (모든 DataFrame에 적용)
-        dataframes_to_normalize = [df_ohlcv]
-        for i, df_item in enumerate(dataframes_to_normalize):
-            if df_item.empty:  # 비어있는 DataFrame은 건너뜀
-                print(f"주의: {i + 1}번째 DataFrame이 비어있어 정규화를 건너뜁니다.")
-                continue
-            if df_item.index.tz is not None:
-                df_item.index = df_item.index.tz_localize(None)
-            df_item.index = df_item.index.normalize()
-        print("✅ 모든 로드된 데이터의 시간대 및 시간 정보 통일 완료.")
-
-        # --- 데이터 병합 ---
-
-        df_merged = df_ohlcv
-
-
-        print("✅ 데이터 병합 완료.")
-
-        # --- 데이터 전처리 ---
+        # 데이터 전처리: 비어있는 값(NaN)을 바로 이전 값으로 채웁니다 (forward fill)
         df_merged.ffill(inplace=True)
-        # 병합 과정에서 모든 데이터가 필수적인지, 아니면 특정 데이터만 필수인지에 따라 dropna 기준 변경 가능
-        # 여기서는 'close' 가격과, 만약 시장 지수를 전략에 사용한다면 'market_index_value'도 필수라고 가정
-        required_columns_for_dropna = ['close']
-        if 'market_index_value' in df_merged.columns:  # 시장 지수가 성공적으로 병합되었다면
-            required_columns_for_dropna.append('market_index_value')
-        df_merged.dropna(subset=required_columns_for_dropna, inplace=True)
+        # 'close' 가격 데이터가 없는 행은 백테스팅에 의미가 없으므로 제거합니다.
+        df_merged.dropna(subset=['close'], inplace=True)
 
         print(f"✅ 데이터 전처리 완료. (최종 {len(df_merged)}개 행)")
 
@@ -181,14 +159,14 @@ def load_and_prepare_data(ohlcv_db_path, ohlcv_table):
         print(f"데이터 로드 또는 병합 중 오류 발생: {e}")
         return pd.DataFrame()
 
-# --- 3. 기술적 지표 추가 함수 (수정) ---
+
 def add_technical_indicators(df: pd.DataFrame, strategies: list):
     """실행할 전략 목록을 기반으로 필요한 모든 기술적 보조지표를 동적으로 계산합니다."""
     print("\n--- 기술적 지표 동적 계산 시작 ---")
     if df is None or df.empty: return df
-    df_copy = df.copy()
+    df_copy = df.copy()  # 원본 데이터 보존을 위해 복사본 사용
 
-    # 필요한 모든 기간을 수집 (더 이상 24를 곱하지 않음)
+    # 앞으로 실행할 모든 전략들에서 필요한 지표의 '기간(period)' 값들을 모두 수집
     sma_periods, high_low_periods, rsi_periods = set(), set(), set()
     for params in strategies:
         for key, value in params.items():
@@ -198,89 +176,77 @@ def add_technical_indicators(df: pd.DataFrame, strategies: list):
                     int(value))
                 if 'rsi_period' in key: rsi_periods.add(int(value))
 
+    # 수집된 기간 값들을 이용해 필요한 지표들을 한 번에 계산 (효율적)
+    # df_copy.ta.sma(...)는 pandas_ta 라이브러리의 기능으로, 자동으로 SMA를 계산하고 DataFrame에 추가해줍니다.
     for period in sorted(list(sma_periods)): df_copy.ta.sma(length=period, append=True)
     for period in sorted(list(high_low_periods)):
         df_copy[f'high_{period}d'] = df_copy['high'].rolling(window=period).max()
         df_copy[f'low_{period}d'] = df_copy['low'].rolling(window=period).min()
     for period in sorted(list(rsi_periods)): df_copy.ta.rsi(length=period, append=True)
 
-    # 기타 고정 지표 (필요시 이 값들도 파라미터화 가능)
-    df_copy.ta.rsi(length=14, append=True)
-    df_copy.ta.bbands(length=20, std=2, append=True)
-    df_copy.ta.atr(length=14, append=True, col_names=('ATRr_14',))
-    df_copy['range'] = df_copy['high'].shift(1) - df_copy['low'].shift(1)
-    df_copy.ta.obv(append=True)
-
-    # (참고) 거시경제지표 이평선 추가 (필요 시)
-    if 'nasdaq_close' in df_copy.columns:
-        df_copy['nasdaq_sma_200'] = df_copy['nasdaq_close'].rolling(window=200).mean()
+    # 모든 전략에서 공통적으로 사용할 수 있는 기본 지표들도 계산
+    df_copy.ta.atr(length=14, append=True, col_names=('ATRr_14',))  # ATR (변동성 지표)
+    df_copy['range'] = df_copy['high'].shift(1) - df_copy['low'].shift(1)  # 전일 변동폭
 
     return df_copy
 
 
+# --- 각 전략의 매수/매도 신호를 생성하는 함수들 ---
+# 모든 전략 함수는 DataFrame과 파라미터 딕셔너리를 입력받아,
+# 'signal' 이라는 컬럼을 추가하여 반환합니다. (1: 매수, -1: 매도, 0: 관망)
+
 def strategy_trend_following(df, params):
+    # N일 신고가 돌파 & 거래량 급증 시 매수
     buy_condition = (df['high'] > df[f"high_{params.get('breakout_window')}d"].shift(1)) & \
                     (df['volume'] > df['volume'].rolling(window=params.get('volume_avg_window')).mean().shift(
                         1) * params.get('volume_multiplier'))
-    if params.get('long_term_sma_period'): buy_condition &= (
-                df['close'] > df[f"SMA_{params.get('long_term_sma_period')}"])
+    # 장기 이동평균선 위에 있을 때만 매수 (추세 필터)
+    if params.get('long_term_sma_period'):
+        buy_condition &= (df['close'] > df[f"SMA_{params.get('long_term_sma_period')}"])
     df['signal'] = np.where(buy_condition, 1, 0)
     return df
 
 
 def strategy_volatility_breakout(df, params):
-    base_buy_condition = df['high'] > (df['open'] + df['range'] * params.get('k', 0.5))
-    if params.get('long_term_sma_period'): base_buy_condition &= (
-                df['close'] > df[f"SMA_{params.get('long_term_sma_period')}"])
-    df['signal'] = np.where(base_buy_condition, 1, 0)
+    # (시가 + 전일 변동폭 * k) 가격을 현재 고가가 돌파하면 매수
+    buy_condition = df['high'] > (df['open'] + df['range'] * params.get('k', 0.5))
+    if params.get('long_term_sma_period'):
+        buy_condition &= (df['close'] > df[f"SMA_{params.get('long_term_sma_period')}"])
+    df['signal'] = np.where(buy_condition, 1, 0)
     return df
 
 
 def strategy_turtle_trading(df, params):
-    base_buy_condition = df['high'] > df[f"high_{params.get('entry_period')}d"].shift(1)
-    if params.get('long_term_sma_period'): base_buy_condition &= (
-                df['close'] > df[f"SMA_{params.get('long_term_sma_period')}"])
-    df['signal'] = np.where(base_buy_condition, 1, 0)
+    # N일 신고가를 돌파하면 매수
+    buy_condition = df['high'] > df[f"high_{params.get('entry_period')}d"].shift(1)
+    if params.get('long_term_sma_period'):
+        buy_condition &= (df['close'] > df[f"SMA_{params.get('long_term_sma_period')}"])
+    df['signal'] = np.where(buy_condition, 1, 0)
     return df
 
 
 def strategy_rsi_mean_reversion(df, params):
+    # RSI가 과매도선을 상향 돌파하면 매수, 과매수선을 하향 돌파하면 매도
     rsi_col = f"RSI_{params.get('rsi_period')}"
-    base_buy_condition = (df[rsi_col] > params.get('oversold_level')) & (
+    buy_condition = (df[rsi_col] > params.get('oversold_level')) & (
                 df[rsi_col].shift(1) <= params.get('oversold_level'))
-    if params.get('long_term_sma_period'): base_buy_condition &= (
-                df['close'] > df[f"SMA_{params.get('long_term_sma_period')}"])
+    if params.get('long_term_sma_period'):
+        buy_condition &= (df['close'] > df[f"SMA_{params.get('long_term_sma_period')}"])
     sell_condition = (df[rsi_col] < params.get('overbought_level')) & (
                 df[rsi_col].shift(1) >= params.get('overbought_level'))
-    df['signal'] = np.where(base_buy_condition, 1, np.where(sell_condition, -1, 0))
+    df['signal'] = np.where(buy_condition, 1, np.where(sell_condition, -1, 0))
     return df
 
-def strategy_dual_momentum(df, params):
-    """
-    전략 3: 듀얼 모멘텀 (절대 모멘텀 + 상대 모멘텀)
-    """
-    abs_momentum_period = params.get('abs_momentum_period', 120)  # 약 6개월
-    rel_momentum_period = params.get('rel_momentum_period', 120)
 
-    # 절대 모멘텀: 자산의 N일 전 가격보다 현재 가격이 높은가?
-    df['abs_momentum'] = df['close'] / df['close'].shift(abs_momentum_period) - 1
-    is_abs_momentum_positive = df['abs_momentum'] > 0
-
-    # 상대 모멘텀: 자산의 수익률이 시장 지수의 수익률보다 높은가?
-    df['asset_return'] = df['close'] / df['close'].shift(rel_momentum_period) - 1
-    df['market_return'] = df['market_index_value'] / df['market_index_value'].shift(rel_momentum_period) - 1
-    is_rel_momentum_stronger = df['asset_return'] > df['market_return']
-
-    buy_condition = is_abs_momentum_positive & is_rel_momentum_stronger
-    df['signal'] = np.where(buy_condition, 1, 0)
-    return df
-
-# --- 4. 전략 실행기 (신규) ---
+# --- 전략 실행기 ---
 def generate_signals(df, params):
+    """파라미터에 명시된 전략 이름에 맞는 함수를 호출하여 신호를 생성하는 함수"""
     strategy_name = params.get('strategy_name')
-    strategy_functions = {
-        'trend_following': strategy_trend_following, 'volatility_breakout': strategy_volatility_breakout,
-        'turtle_trading': strategy_turtle_trading, 'rsi_mean_reversion': strategy_rsi_mean_reversion,
+    strategy_functions = {  # 각 전략 이름과 실제 함수를 연결하는 딕셔너리
+        'trend_following': strategy_trend_following,
+        'volatility_breakout': strategy_volatility_breakout,
+        'turtle_trading': strategy_turtle_trading,
+        'rsi_mean_reversion': strategy_rsi_mean_reversion,
     }
     if strategy_name in strategy_functions:
         return strategy_functions[strategy_name](df, params)
@@ -290,131 +256,142 @@ def generate_signals(df, params):
 
 # --- 5. 백테스팅 실행 함수 ---
 def run_backtest(df_full_data, params):
+    """본격적인 거래 시뮬레이션을 수행하는 핵심 함수"""
+    # 1. 주어진 데이터와 파라미터로 매수/매도 신호를 먼저 계산합니다.
     df_signals = generate_signals(df_full_data.copy(), params)
-    krw_balance, asset_balance, asset_avg_buy_price = INITIAL_CAPITAL, 0.0, 0.0
-    trade_log, portfolio_history = [], []
-    highest_price_since_buy, partial_profit_taken = 0, False
 
+    # 2. 시뮬레이션을 위한 초기 상태 변수들을 설정합니다.
+    krw_balance, asset_balance, asset_avg_buy_price = INITIAL_CAPITAL, 0.0, 0.0
+    trade_log, portfolio_history = [], []  # 거래 내역과 포트폴리오 가치 변화를 기록할 리스트
+    highest_price_since_buy, partial_profit_taken = 0, False  # 트레일링 스탑, 부분 익절용 변수
+
+    # 3. 데이터프레임을 한 줄씩(하루씩) 순회하며 시뮬레이션을 진행합니다.
     for timestamp, row in df_signals.iterrows():
-        current_price, atr = row['close'], row.get('ATRr_14', 0)
-        if pd.isna(current_price) or current_price <= 0:
-            portfolio_history.append({'timestamp': timestamp, 'portfolio_value': portfolio_history[-1][
-                'portfolio_value'] if portfolio_history else INITIAL_CAPITAL})
+        current_price = row['close']
+        if pd.isna(current_price) or current_price <= 0:  # 가격 데이터가 없으면 건너뛰기
             continue
 
-        should_sell = False
+        should_sell = False  # 매도 여부를 결정하는 플래그
+
+        # 4. 현재 자산을 보유하고 있는 경우, 매도 조건을 확인합니다.
         if asset_balance > 0:
             highest_price_since_buy = max(highest_price_since_buy, current_price)
 
-            # 부분 익절 로직
+            # [매도 조건 1] 부분 익절: 목표 수익률 달성 시
             profit_target = params.get('partial_profit_target')
             if profit_target and not partial_profit_taken and (
                     current_price / asset_avg_buy_price - 1) >= profit_target:
                 asset_to_sell = asset_balance * params.get('partial_profit_ratio', 0.5)
                 if asset_to_sell * current_price >= MIN_ORDER_KRW:
-                    krw_balance += (asset_to_sell * current_price * (1 - FEE_RATE));
-                    asset_balance -= asset_to_sell;
+                    krw_balance += (asset_to_sell * current_price * (1 - FEE_RATE))
+                    asset_balance -= asset_to_sell
                     partial_profit_taken = True
                     trade_log.append({'timestamp': timestamp, 'type': 'partial_sell', 'price': current_price,
                                       'amount': asset_to_sell})
+                    # 부분 익절 후에는 다른 매도 로직을 타지 않고 다음 날로 넘어갑니다.
                     portfolio_history.append(
                         {'timestamp': timestamp, 'portfolio_value': krw_balance + (asset_balance * current_price)})
                     continue
 
-            # 1. ATR 손절매 (값이 있을 때만 실행)
+            # [매도 조건 2] ATR 손절매
             stop_loss = params.get('stop_loss_atr_multiplier')
-            if not should_sell and stop_loss and atr > 0 and current_price < (
-                    asset_avg_buy_price - (stop_loss * atr)): should_sell = True
+            if not should_sell and stop_loss and row.get('ATRr_14', 0) > 0:
+                if current_price < (asset_avg_buy_price - (stop_loss * row.get('ATRr_14'))):
+                    should_sell = True
 
-            # 2. 트레일링 스탑 (값이 있을 때만 실행)
+            # [매도 조건 3] 트레일링 스탑
             trailing_stop = params.get('trailing_stop_percent')
-            if not should_sell and trailing_stop and current_price < highest_price_since_buy * (
-                    1 - trailing_stop): should_sell = True
+            if not should_sell and trailing_stop:
+                if current_price < highest_price_since_buy * (1 - trailing_stop):
+                    should_sell = True
 
-            # 3. SMA 이탈 청산 (값이 있을 때만 실행)
+            # [매도 조건 4] 이동평균선 이탈 청산
             exit_sma_period = params.get('exit_sma_period')
             if not should_sell and exit_sma_period and exit_sma_period > 0:
                 if current_price < row.get(f"SMA_{exit_sma_period}", float('inf')):
-                     should_sell = True
+                    should_sell = True
 
-            # 4. 터틀 전략 고유 청산 (값이 있을 때만 실행)
+            # [매도 조건 5] 터틀 트레이딩 전용 청산 (N일 최저가 하향 이탈)
             if not should_sell and params.get('strategy_name') == 'turtle_trading':
                 exit_period = params.get('exit_period')
-                if exit_period and current_price < row.get(f'low_{exit_period}d', float('inf')): should_sell = True
+                if exit_period and current_price < row.get(f'low_{exit_period}d', float('inf')):
+                    should_sell = True
 
-            # 전략이 직접 매도 신호를 보냈을 경우
-            if not should_sell and row.get('signal') == -1: should_sell = True
+            # [매도 조건 6] 전략이 직접 매도 신호(-1)를 보냈을 경우
+            if not should_sell and row.get('signal') == -1:
+                should_sell = True
 
-        # --- 거래 실행 ---
-        if should_sell and asset_balance > 0:
+        # --- 5. 최종 결정된 거래를 실행합니다 ---
+        if should_sell and asset_balance > 0:  # 매도 결정!
             krw_balance += (asset_balance * current_price * (1 - FEE_RATE))
             trade_log.append({'timestamp': timestamp, 'type': 'sell', 'price': current_price, 'amount': asset_balance})
             asset_balance = 0.0
-        elif row.get('signal') == 1 and asset_balance == 0:
-            buy_amount_krw = krw_balance * 0.95
+        elif row.get('signal') == 1 and asset_balance == 0:  # 매수 결정!
+            buy_amount_krw = krw_balance * 0.95  # 현금의 95%를 매수에 사용
             if buy_amount_krw > MIN_ORDER_KRW:
                 asset_acquired = (buy_amount_krw * (1 - FEE_RATE)) / current_price
-                krw_balance -= buy_amount_krw;
-                asset_balance += asset_acquired;
+                krw_balance -= buy_amount_krw
+                asset_balance += asset_acquired
                 asset_avg_buy_price = current_price
+                # 매수 후, 트레일링 스탑과 부분 익절을 위한 변수 초기화
                 highest_price_since_buy, partial_profit_taken = current_price, False
                 trade_log.append(
                     {'timestamp': timestamp, 'type': 'buy', 'price': current_price, 'amount': asset_acquired})
 
-        # 포트폴리오 가치 기록
+        # 6. 매일의 포트폴리오 가치를 계산하여 기록합니다.
         portfolio_history.append(
             {'timestamp': timestamp, 'portfolio_value': krw_balance + (asset_balance * current_price)})
+
+    # 모든 시뮬레이션이 끝난 후, 거래 기록과 포트폴리오 변화 기록을 반환합니다.
     return pd.DataFrame(trade_log), pd.DataFrame(portfolio_history)
 
 
 def get_round_trip_trades(trade_log_df):
-    """
-    부분 익절을 포함한 거래 기록을 바탕으로 완성된 거래(Round Trip)를 재구성합니다.
-    (기존 backtesting.py의 정교한 로직으로 복원)
-    """
+    """거래 기록을 바탕으로 '매수 -> 매도'로 이어지는 완성된 거래(Round Trip)를 재구성하여 손익(PNL)을 계산"""
     if trade_log_df.empty: return pd.DataFrame()
     round_trips = []
-    active_buy_info = None
+    active_buy_info = None  # 현재 진행중인 매수 정보
     for _, trade in trade_log_df.iterrows():
-        if trade['type'] == 'buy':
+        if trade['type'] == 'buy':  # 매수 거래를 만나면 정보 저장
             active_buy_info = {'entry_date': trade['timestamp'], 'entry_price': trade['price'],
                                'amount_remaining': trade['amount']}
         elif (trade['type'] == 'partial_sell' or trade['type'] == 'sell') and active_buy_info:
+            # 매도 거래를 만나면 손익 계산
             amount_sold = trade['amount'] if trade['type'] == 'partial_sell' else active_buy_info['amount_remaining']
             pnl = (trade['price'] - active_buy_info['entry_price']) * amount_sold
             round_trips.append({'pnl': pnl})
-            if trade['type'] == 'partial_sell':
+            if trade['type'] == 'partial_sell':  # 부분 매도면 남은 수량 업데이트
                 active_buy_info['amount_remaining'] -= amount_sold
-                if active_buy_info['amount_remaining'] < 1e-9: active_buy_info = None
-            else:
+            else:  # 전량 매도면 매수 정보 초기화
                 active_buy_info = None
     return pd.DataFrame(round_trips)
 
 
-def analyze_performance_detailed(portfolio_history_df, trade_log_df, initial_capital, params, interval,
-                                 risk_free_rate_daily=0.0):
+def analyze_performance_detailed(portfolio_history_df, trade_log_df, initial_capital, params, interval):
+    """백테스팅 결과를 바탕으로 다양한 성과 지표를 계산하고 출력하는 함수"""
     if portfolio_history_df.empty: return {}
 
-    #기본 성과
-    experiment_name_to_print = params.get('experiment_name', params.get('strategy_name')) # 없으면 strategy_name 사용
+    # 총수익률(ROI) 계산
     final_value = portfolio_history_df['portfolio_value'].iloc[-1]
     total_roi_pct = (final_value / initial_capital - 1) * 100
 
-    #MDD
+    # 최대 낙폭(MDD) 계산
     portfolio_history_df['rolling_max'] = portfolio_history_df['portfolio_value'].cummax()
     mdd_pct = (portfolio_history_df['portfolio_value'] / portfolio_history_df['rolling_max'] - 1).min() * 100
 
+    # 일일(또는 시간당) 수익률 계산
     portfolio_history_df['returns'] = portfolio_history_df['portfolio_value'].pct_change().fillna(0)
     periods_per_year = 365 if interval == 'day' else 365 * 24
 
-    #샤프지수
+    # 샤프 지수(Sharpe Ratio): (위험 대비 수익성), 높을수록 좋음
     sharpe_ratio = portfolio_history_df['returns'].mean() / portfolio_history_df['returns'].std() * np.sqrt(
         periods_per_year) if portfolio_history_df['returns'].std() > 0 else 0
     annual_return = portfolio_history_df['returns'].mean() * periods_per_year
 
-    #캘머 지수
+    # 캘머 지수(Calmar Ratio): (최대 낙폭 대비 수익성), 높을수록 좋음
     calmar_ratio = annual_return / (abs(mdd_pct) / 100) if mdd_pct != 0 else 0
 
+    # 거래 기반 지표 계산 (승률, 수익팩터 등)
     rt_trades_df = get_round_trip_trades(trade_log_df)
     total_trades, win_rate_pct, profit_factor = 0, 0.0, 0.0
     if not rt_trades_df.empty:
@@ -426,19 +403,13 @@ def analyze_performance_detailed(portfolio_history_df, trade_log_df, initial_cap
         gross_loss = abs(losses['pnl'].sum())
         profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
 
-    # (복원) 거래 이벤트 상세 카운트 출력
-    # num_buy = len(trade_log_df[trade_log_df['type'] == 'buy'])
-    # num_partial_sell = len(trade_log_df[trade_log_df['type'] == 'partial_sell'])
-    # num_full_sell = len(trade_log_df[trade_log_df['type'] == 'sell'])
-
     # 결과 출력
-    print(f"전략명: {params.get('strategy_name')}")
-    print(f"실험명(설명): {experiment_name_to_print}") # 콘솔 출력에 추가
+    print(f"\n--- 결과 분석: {params.get('experiment_name')} ---")
     print(f"총 수익률 (ROI): {total_roi_pct:.2f}% | 최대 낙폭 (MDD): {mdd_pct:.2f}%")
     print(f"샤프 지수: {sharpe_ratio:.2f} | 캘머 지수: {calmar_ratio:.2f}")
     print(f"총 거래 횟수: {total_trades} | 승률: {win_rate_pct:.2f}% | 수익 팩터: {profit_factor:.2f}")
-    # print(f"  매수 이벤트: {num_buy} 회 | 부분 매도: {num_partial_sell} 회 | 전량 매도: {num_full_sell} 회")
 
+    # 결과를 딕셔너리 형태로 정리하여 반환 (나중에 CSV로 저장하기 위함)
     return {
         '실험명': params.get('experiment_name', ''), '전략명': params.get('strategy_name'),
         '파라미터': str(
@@ -451,11 +422,9 @@ def analyze_performance_detailed(portfolio_history_df, trade_log_df, initial_cap
 
 
 def log_results_to_csv(result_data, log_file="advanced_backtest_log.csv"):
-    """백테스팅 결과와 파라미터를 CSV 파일에 기록합니다."""
-    # 파일이 존재하지 않으면 헤더와 함께 새로 만들고, 존재하면 데이터만 추가
-    is_file_exist = os.path.exists(log_file)
-
+    """백테스팅 결과를 CSV 파일에 기록하는 함수"""
     df_result = pd.DataFrame([result_data])
+    # 파일이 없으면 헤더와 함께 새로 쓰고, 파일이 있으면 헤더 없이 내용만 추가(append)
     df_result.to_csv(log_file, index=False, mode='a', header=not os.path.exists(log_file), encoding='utf-8-sig')
 
 
@@ -464,19 +433,21 @@ def log_results_to_csv(result_data, log_file="advanced_backtest_log.csv"):
 # =============================================================================
 if __name__ == "__main__":
 
-    strategies_to_run = []
+    strategies_to_run = []  # 실행할 모든 실험(전략+파라미터 조합)을 저장할 리스트
 
+    # 설정된 MODE에 따라 실행할 실험 목록을 생성
     if MODE == 'GRID_SEARCH':
         config = GRID_SEARCH_CONFIG
         keys, values = config['param_grid'].keys(), config['param_grid'].values()
+        # itertools.product를 사용하여 파라미터 그리드의 모든 조합을 생성
         for i, combo_values in enumerate(itertools.product(*values)):
+            # 기본 파라미터와 그리드 서치용 파라미터를 합쳐 하나의 실험 세트를 만듦
             params = {**config['base_params'], **dict(zip(keys, combo_values))}
-            if config['target_strategy_name'] == 'turtle_trading' and params.get('entry_period') <= params.get(
-                'exit_period'): continue
-            exp_name_parts = [f"{key[:4]}{val}" for key, val in dict(zip(keys, combo_values)).items()]
+            exp_name = f"GS_{config['target_strategy_name'][:5]}_{i}"  # 실험 이름 생성
             params.update({
-                'strategy_name': config['target_strategy_name'], 'ticker_tested': config['target_ticker'],
-                'experiment_name': f"GS_{config['target_strategy_name'][:5]}_{'_'.join(exp_name_parts)}_{i}"
+                'strategy_name': config['target_strategy_name'],
+                'ticker_tested': config['target_ticker'],
+                'experiment_name': exp_name
             })
             strategies_to_run.append(params)
 
@@ -493,41 +464,48 @@ if __name__ == "__main__":
 
     print(f"\n총 {len(strategies_to_run)}개의 실험을 진행합니다.")
 
-    all_results = []
-    data_cache = {}
+    all_results = []  # 모든 실험 결과를 저장할 리스트
+    data_cache = {}  # 로드한 데이터를 재사용하기 위한 캐시 (메모리 저장소)
 
+    # 생성된 실험 목록을 하나씩 실행
     for strategy_params in strategies_to_run:
         ticker = strategy_params['ticker_tested']
 
+        # 데이터 캐싱: 동일한 티커의 데이터를 여러 번 로드하지 않도록 처리
         if ticker not in data_cache:
             print(f"\n\n===== {ticker} ({TARGET_INTERVAL}) 데이터 로딩 및 지표 계산 =====")
             ohlcv_table = f"{ticker.replace('-', '_')}_{TARGET_INTERVAL}"
-            df_raw = load_and_prepare_data(
-                ohlcv_db_path=OHLCV_DB_PATH,
-                ohlcv_table=ohlcv_table,
-            )
-            if df_raw.empty: continue
+            # 데이터 로드
+            df_raw = load_and_prepare_data(ohlcv_db_path=OHLCV_DB_PATH, ohlcv_table=ohlcv_table)
+            if df_raw.empty: continue  # 데이터가 없으면 다음 실험으로
 
+            # 이 티커에 대해 실행될 모든 전략을 찾아서 필요한 지표를 한 번에 계산
             strategies_for_this_ticker = [s for s in strategies_to_run if s.get('ticker_tested') == ticker]
             data_cache[ticker] = add_technical_indicators(df_raw, strategies_for_this_ticker)
 
-        df_ready = data_cache[ticker]
+        df_ready = data_cache[ticker]  # 캐시에서 준비된 데이터 가져오기
 
+        # 백테스트 실행!
         trade_log_df, portfolio_history_df = run_backtest(df_ready.copy(), strategy_params)
 
-        if trade_log_df is not None and portfolio_history_df is not None:
+        # 결과 분석 및 저장
+        if portfolio_history_df is not None and not portfolio_history_df.empty:
             summary = analyze_performance_detailed(portfolio_history_df, trade_log_df, INITIAL_CAPITAL, strategy_params,
                                                    TARGET_INTERVAL)
             if summary:
                 summary['티커'] = ticker
                 all_results.append(summary)
-                log_results_to_csv(summary)
+                log_results_to_csv(summary)  # 결과를 CSV 파일에 즉시 기록
 
+    # 모든 실험 완료 후 최종 결과 요약 출력
     if all_results:
         results_df = pd.DataFrame(all_results)
+        # 캘머 지수(Calmar Ratio)를 기준으로 내림차순 정렬
         results_df = results_df.sort_values(by='Calmar', ascending=False)
-        print("\n\n" + "=" * 90 + "\n" + "<<< 최종 백테스트 결과 요약 (정렬 기준: Calmar 내림차순) >>>".center(85) + "\n" + "=" * 90)
+        print("\n\n" + "=" * 90)
+        print("<<< 최종 백테스트 결과 요약 (정렬 기준: Calmar 내림차순) >>>".center(85))
+        print("=" * 90)
         cols_to_display = ['티커', '실험명', 'ROI (%)', 'MDD (%)', 'Calmar', 'Sharpe', 'Profit Factor', 'Win Rate (%)',
                            'Total Trades']
-        print(results_df[cols_to_display])
+        print(results_df[cols_to_display].to_string(index=False))  # to_string으로 모든 행이 보이게 출력
         print("=" * 90)
